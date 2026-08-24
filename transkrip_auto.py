@@ -4,9 +4,119 @@ import pandas as pd
 import os
 import torch
 import re
+import ssl
+import urllib.request
 from datetime import datetime, timedelta
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+
+# --- SSL PATCH (PERBAIKAN WINDOWS CERTIFICATE STORE) ---
+def patch_ssl_windows():
+    """
+    Perbaiki ssl.SSLError: [ASN1: NOT_ENOUGH_DATA] (_ssl.c) di Windows.
+
+    Penyebab: ada sertifikat korup di Windows Certificate Store sehingga
+    Python gagal memuat CA certificates saat membuat SSL context default.
+    SSL context default inilah yang dipakai urllib untuk mendownload
+    model Whisper.
+
+    Solusi: buat SSL context langsung dari bundle 'certifi' (tanpa menyentuh
+    Windows Certificate Store sama sekali), lalu pasang sebagai opener
+    global urllib. Dengan begitu download model Whisper menjadi aman.
+    """
+    try:
+        import certifi
+        ctx = ssl.create_default_context(cafile=certifi.where())
+        handler = urllib.request.HTTPSHandler(context=ctx)
+        urllib.request.install_opener(urllib.request.build_opener(handler))
+        return True
+    except Exception as e:
+        print(f"⚠️ SSL patch gagal diterapkan: {e}")
+        print("💡 Coba jalankan: pip install certifi")
+        return False
+
+def adalah_error_ssl(pesan_error):
+    """Deteksi apakah error berasal dari masalah SSL/sertifikat"""
+    pesan_upper = str(pesan_error).upper()
+    kata_kunci = ('SSL', 'CERTIFICATE', 'ASN1', 'NOT_ENOUGH_DATA')
+    return any(k in pesan_upper for k in kata_kunci)
+
+# Terapkan patch sejak awal agar download model Whisper langsung aman
+patch_ssl_windows()
+
+# --- MODEL LOADING (DENGAN RETRY SSL & FALLBACK OTOMATIS) ---
+_MODEL_URUTAN_BESAR_KE_KECIL = ['large', 'medium', 'small', 'base', 'tiny']
+
+def load_whisper_model(model_size="large"):
+    """
+    Memuat model Whisper dengan penanganan error yang tangguh:
+      1. Coba muat ukuran model yang diminta.
+      2. Jika gagal karena SSL -> terapkan patch_ssl_windows() lalu coba lagi.
+      3. Jika tetap gagal -> fallback otomatis ke model yang lebih kecil.
+      4. Jika semuanya gagal -> raise dengan panduan download manual.
+
+    Return: tuple (model, device, ukuran_model_terpakai)
+    Raise : RuntimeError beserta instruksi solusi manual
+    """
+    if model_size in _MODEL_URUTAN_BESAR_KE_KECIL:
+        kandidat = _MODEL_URUTAN_BESAR_KE_KECIL[
+            _MODEL_URUTAN_BESAR_KE_KECIL.index(model_size):
+        ]
+    else:
+        # Varian lain (mis. large-v3, turbo, *.en): coba apa adanya, lalu base
+        kandidat = [model_size] + (['base'] if model_size != 'base' else [])
+
+    ssl_terpatch = False
+    error_terakhir = None
+
+    for level, ukuran in enumerate(kandidat):
+        for percobaan in range(2):  # percobaan 1: normal, 2: setelah patch SSL
+            try:
+                if level == 0 and percobaan == 0:
+                    print(f"📥 Loading Whisper model: {ukuran}...")
+                else:
+                    print(f"📥 Loading Whisper model: {ukuran} (fallback)...")
+                model = whisper.load_model(ukuran)
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+                print(f"✅ Model '{ukuran}' berhasil dimuat!")
+                print(f"🖥️ Device: {device}")
+                if level > 0:
+                    print(f"⚠️ Catatan: '{model_size}' gagal dimuat, "
+                          f"menggunakan fallback '{ukuran}'.")
+                return model, device, ukuran
+            except Exception as e:
+                error_terakhir = e
+                print(f"⚠️ Gagal memuat model '{ukuran}': {e}")
+
+                if not ssl_terpatch and adalah_error_ssl(e):
+                    print("🔧 Terdeteksi masalah sertifikat SSL Windows.")
+                    print("🔧 Menerapkan patch SSL (bundle certifi, "
+                          "bypass Windows Certificate Store)...")
+                    ssl_terpatch = patch_ssl_windows()
+                    if ssl_terpatch:
+                        continue  # ulangi ukuran yang sama setelah patch
+                break  # lanjut ke kandidat model berikutnya
+
+    # Semua upaya gagal -> berikan panduan download manual (offline)
+    cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "whisper")
+    url_model = getattr(whisper, "_MODELS", {}).get(model_size)
+    if url_model:
+        tujuan = os.path.join(cache_dir, os.path.basename(url_model))
+        panduan = (f'   Invoke-WebRequest -Uri "{url_model}" '
+                   f'-OutFile "{tujuan}"')
+    else:
+        tujuan = os.path.join(cache_dir, f"{model_size}.pt")
+        panduan = f"   Download model '{model_size}' dan simpan sebagai: {tujuan}"
+
+    raise RuntimeError(
+        "\n❌ Semua upaya memuat model Whisper gagal."
+        f"\n   Error terakhir: {error_terakhir}"
+        "\n\n💡 SOLUSI MANUAL:"
+        f"\n   1. Buat folder: {cache_dir}"
+        "\n   2. Download model via PowerShell:"
+        f"\n{panduan}"
+        "\n   3. Jalankan ulang program (Whisper otomatis memakai file lokal)."
+    )
 
 def format_waktu(detik):
     """Mengubah detik menjadi format HH:MM:SS atau MM:SS"""
@@ -281,7 +391,7 @@ def create_beautiful_table_excel(video_info, segments, paragraphs, filename, out
             ["Total Karakter", f"{total_chars:,}"],
             ["Kata per Menit", f"{words_per_minute:.1f}"],
             ["Rata-rata Durasi Segmen", f"{avg_segment_duration:.2f} detik"],
-            ["Rata-rata Kata per Segmen", f"{total_words/total_segments:.1f}"],
+            ["Rata-rata Kata per Segmen", f"{total_words/total_segments:.1f}" if total_segments > 0 else "0"],
         ]
         
         if segments:
@@ -517,7 +627,9 @@ def transkrip_youtube_auto(video_url="https://youtu.be/l3X2SaCndiI?si=CfkAJHcFj0
         print(f"👤 Channel: {video_info['uploader']}")
         
         # --- CREATE UNIQUE OUTPUT FOLDER ---
-        output_folder = create_unique_output_folder(video_info['title'], base_folder)        # --- STEP 2: LOAD AI MODEL ---
+        output_folder = create_unique_output_folder(video_info['title'], base_folder)
+
+        # --- STEP 2: LOAD AI MODEL ---
         print(f"\n🤖 Step 2: Memuat model Whisper AI...")
         
         # Pilihan model (dari kecil ke besar):
@@ -526,24 +638,13 @@ def transkrip_youtube_auto(video_url="https://youtu.be/l3X2SaCndiI?si=CfkAJHcFj0
         # "small" (244MB) - Akurasi lebih baik
         # "medium" (769MB) - Akurasi tinggi
         # "large" (1.5GB) - Akurasi tertinggi ⭐ RECOMMENDED
+        # (Loading ditangani load_whisper_model(): retry SSL + fallback otomatis)
         
-        print(f"📥 Loading Whisper model: {model_size}...")
+        model, device, ukuran_model = load_whisper_model(model_size)
         
-        try:
-            model = whisper.load_model(model_size)
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            print(f"✅ Model loaded successfully!")
-            print(f"🖥️ Device: {device}")
-            print(f"🧠 Model: Whisper {model_size.capitalize()}")
-            if model_size == "large":
-                print("🎯 Using highest accuracy model - perfect for training data!")
-        except Exception as model_error:
-            print(f"⚠️ Failed to load {model_size} model: {model_error}")
-            print("🔄 Falling back to 'base' model...")
-            model = whisper.load_model("base")
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            print(f"🖥️ Device: {device}")
-            print(f"🧠 Model: Whisper Base (fallback)")
+        print(f"🧠 Model: Whisper {ukuran_model.capitalize()}")
+        if ukuran_model == "large":
+            print("🎯 Using highest accuracy model - perfect for training data!")
         
         # --- STEP 3: TRANSCRIBE ---
         print(f"\n🎙️ Step 3: Memproses transkrip...")
@@ -1000,6 +1101,12 @@ def create_playlist_consolidated_excel(playlist_results, playlist_info, filename
     Membuat satu file Excel gabungan untuk seluruh playlist
     Fokus pada teks untuk pelatihan, tanpa detail timestamp
     """
+    # Guard: jangan proses jika tidak ada video yang berhasil
+    # (mencegah division by zero pada statistik rata-rata)
+    if not playlist_results.get('processed_videos'):
+        print("⚠️ Tidak ada video yang berhasil diproses — Excel konsolidasi dilewati.")
+        return {'status': 'error', 'message': 'Tidak ada video yang berhasil diproses'}
+
     try:
         # Ensure output folder exists
         if not os.path.exists(output_folder):
@@ -1246,6 +1353,7 @@ def create_playlist_consolidated_excel(playlist_results, playlist_info, filename
         total_duration = sum(v['stats']['duration'] for v in playlist_results['processed_videos'])
         total_segments = sum(v['stats']['segments'] for v in playlist_results['processed_videos'])
         avg_words_per_minute = (total_words / (total_duration / 60)) if total_duration > 0 else 0
+        jumlah_video_sukses = max(len(playlist_results['processed_videos']), 1)
         
         stats_data = [
             ["STATISTIK LENGKAP PLAYLIST", ""],
@@ -1262,8 +1370,8 @@ def create_playlist_consolidated_excel(playlist_results, playlist_info, filename
             ["Total Paragraf", f"{total_paragraphs:,}"],
             ["Total Segmen", f"{total_segments:,}"],
             ["Rata-rata Kata/Menit", f"{avg_words_per_minute:.1f}"],
-            ["Rata-rata Kata/Video", f"{total_words/len(playlist_results['processed_videos']):.0f}"],
-            ["Rata-rata Paragraf/Video", f"{total_paragraphs/len(playlist_results['processed_videos']):.1f}"],
+            ["Rata-rata Kata/Video", f"{total_words/jumlah_video_sukses:.0f}"],
+            ["Rata-rata Paragraf/Video", f"{total_paragraphs/jumlah_video_sukses:.1f}"],
             ["", ""],
             ["Info Pelatihan", ""],
             ["Panjang Teks Gabungan", f"{len(combined_text):,} karakter"],
@@ -1413,9 +1521,13 @@ if __name__ == "__main__":
             print(f"✅ Processed: {len(result['processed_videos'])}/{result['playlist_info']['total_videos']} videos")
             print(f"📁 Output folder: {result['playlist_folder']}")
             
-            # Create consolidated Excel
-            excel_consolidated_filename = f"CONSOLIDATED_{output_name}.xlsx"
-            create_playlist_consolidated_excel(result, result['playlist_info'], excel_consolidated_filename, result['playlist_folder'])
+            # Create consolidated Excel (hanya jika ada video yang berhasil)
+            if result['processed_videos']:
+                excel_consolidated_filename = f"CONSOLIDATED_{output_name}.xlsx"
+                create_playlist_consolidated_excel(result, result['playlist_info'], excel_consolidated_filename, result['playlist_folder'])
+            else:
+                print("\n⚠️ Tidak ada video yang berhasil diproses.")
+                print("⏭️ Pembuatan Excel konsolidasi dilewati.")
         else:
             print(f"\n❌ PLAYLIST FAILED: {result['message']}")
     

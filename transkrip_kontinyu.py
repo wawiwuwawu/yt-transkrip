@@ -4,7 +4,39 @@ import pandas as pd
 import os
 import torch
 import re
+import ssl
+import urllib.request
 from datetime import timedelta
+
+# --- SSL PATCH (PERBAIKAN WINDOWS CERTIFICATE STORE) ---
+def patch_ssl_windows():
+    """
+    Perbaiki ssl.SSLError: [ASN1: NOT_ENOUGH_DATA] (_ssl.c) di Windows.
+
+    Penyebab: ada sertifikat korup di Windows Certificate Store sehingga
+    Python gagal memuat CA certificates saat membuat SSL context default.
+    Solusi: buat SSL context langsung dari bundle 'certifi' (tanpa menyentuh
+    Windows Certificate Store), lalu pasang sebagai opener global urllib.
+    """
+    try:
+        import certifi
+        ctx = ssl.create_default_context(cafile=certifi.where())
+        handler = urllib.request.HTTPSHandler(context=ctx)
+        urllib.request.install_opener(urllib.request.build_opener(handler))
+        return True
+    except Exception as e:
+        print(f"⚠️ SSL patch gagal diterapkan: {e}")
+        print("💡 Coba jalankan: pip install certifi")
+        return False
+
+def adalah_error_ssl(pesan_error):
+    """Deteksi apakah error berasal dari masalah SSL/sertifikat"""
+    pesan_upper = str(pesan_error).upper()
+    kata_kunci = ('SSL', 'CERTIFICATE', 'ASN1', 'NOT_ENOUGH_DATA')
+    return any(k in pesan_upper for k in kata_kunci)
+
+# Terapkan patch sejak awal agar download model Whisper langsung aman
+patch_ssl_windows()
 
 def download_audio_ytdlp(video_url, output_path="temp_audio"):
     """Download audio menggunakan yt-dlp"""
@@ -74,7 +106,15 @@ def buat_transkrip_kontinyu(video_url, output_name="transkrip_kontinyu"):
         
         # --- STEP 2: LOAD AI MODEL ---
         print(f"\n🤖 Memuat model Whisper AI...")
-        model = whisper.load_model("base")
+        try:
+            model = whisper.load_model("base")
+        except Exception as model_error:
+            # Jika error SSL (Windows cert store korup) -> patch lalu coba sekali lagi
+            if adalah_error_ssl(model_error) and patch_ssl_windows():
+                print("🔧 Mencoba ulang setelah patch SSL...")
+                model = whisper.load_model("base")
+            else:
+                raise
         device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"🖥️ Device: {device}")
         
